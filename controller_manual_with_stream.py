@@ -158,8 +158,35 @@ if connected:
 rc_state = {"forward": 0, "right": 0, "up": 0, "yaw": 0}
 rc_lock  = threading.Lock()
 
-TICK_MS  = 200 # จังหวะส่งคำสั่ง 5 ครั้ง/วินาที 
-DEADZONE = 15  
+TICK_MS  = 200 # จังหวะส่งคำสั่ง 5 ครั้ง/วินาที
+DEADZONE = 15
+
+# ─────────────────────────────────────────
+#  Action feed — what the drone is physically doing RIGHT NOW.
+#  These moves are discrete blocking commands (not velocity), so we expose each
+#  one's EXEC → DONE lifecycle to the UI to drive the "combo" overlay.
+# ─────────────────────────────────────────
+action_log  = []            # rolling list of recent moves: {id, label, status}
+action_lock = threading.Lock()
+_action_seq = 0
+
+def start_action(label):
+    """Register a move as executing; returns its id so we can finish it later."""
+    global _action_seq
+    with action_lock:
+        _action_seq += 1
+        aid = _action_seq
+        action_log.append({"id": aid, "label": label, "status": "EXEC"})
+        if len(action_log) > 12:
+            del action_log[:len(action_log) - 12]
+    return aid
+
+def finish_action(aid, status="DONE"):
+    with action_lock:
+        for ev in action_log:
+            if ev["id"] == aid:
+                ev["status"] = status
+                break
 
 def rc_tick_loop():
     while True:
@@ -188,21 +215,27 @@ def rc_tick_loop():
         # speed = 150
         # speedYaw = 25
 
+        # Resolve the dominant axis to a human label + the blocking API call to run.
+        if dom_axis == "fwd":
+            label, action = ("FORWARD", lambda: api.single_fly_forward(speed)) if val > 0 \
+                       else ("BACK",    lambda: api.single_fly_back(speed))
+        elif dom_axis == "rgt":
+            label, action = ("RIGHT",   lambda: api.single_fly_right(speed)) if val > 0 \
+                       else ("LEFT",    lambda: api.single_fly_left(speed))
+        elif dom_axis == "up":
+            label, action = ("UP",      lambda: api.single_fly_up(speed)) if val > 0 \
+                       else ("DOWN",    lambda: api.single_fly_down(speed))
+        else:  # yaw
+            label, action = ("YAW RIGHT", lambda: api.single_fly_turnright(speedYaw)) if val > 0 \
+                       else ("YAW LEFT",  lambda: api.single_fly_turnleft(speedYaw))
+
+        # EXEC now, run the (blocking) move to completion, then mark DONE/FAIL.
+        aid = start_action(label)
         try:
-            if dom_axis == "fwd":
-                if val > 0: api.single_fly_forward(speed)
-                else:       api.single_fly_back(speed)
-            elif dom_axis == "rgt":
-                if val > 0: api.single_fly_right(speed)
-                else:       api.single_fly_left(speed)
-            elif dom_axis == "up":
-                if val > 0: api.single_fly_up(speed)
-                else:       api.single_fly_down(speed)
-            elif dom_axis == "yaw":
-                if val > 0: api.single_fly_turnright(speedYaw)
-                else:       api.single_fly_turnleft(speedYaw)
+            action()
+            finish_action(aid, "DONE")
         except Exception:
-            pass 
+            finish_action(aid, "FAIL")
 
 threading.Thread(target=rc_tick_loop, daemon=True).start()
 
@@ -320,6 +353,50 @@ HTML = r"""<!DOCTYPE html>
       border: 1px solid var(--accent); border-radius: 50%;
   }
 
+  /* ── Action feed (top-right): game-combo readout of what the drone is doing ── */
+  .action-feed {
+      position: absolute; top: 78px; right: 15px; z-index: 20;
+      display: flex; flex-direction: column; align-items: flex-end; gap: 7px;
+      pointer-events: none; max-width: 46vw;
+  }
+  .combo-badge {
+      font-family: 'Orbitron', sans-serif; font-weight: 900; font-size: 0.95rem;
+      color: #fff; letter-spacing: 2px; padding: 4px 14px; border-radius: 20px;
+      border: 1px solid var(--accent);
+      background: linear-gradient(90deg, rgba(255,45,85,0.15), rgba(0,229,255,0.28));
+      text-shadow: 0 0 10px var(--accent);
+      opacity: 0; transform: scale(0.5) translateX(20px); transition: opacity .15s, transform .15s;
+  }
+  .combo-badge.show { opacity: 1; transform: scale(1) translateX(0); }
+  .combo-badge #combo-count { color: var(--danger); font-size: 1.15rem; }
+
+  .action-list { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
+  .action-chip {
+      display: flex; align-items: center; gap: 9px; min-width: 150px;
+      font-family: 'Orbitron', sans-serif; font-weight: 700; font-size: 0.78rem;
+      color: #fff; letter-spacing: 1px; padding: 7px 13px; border-radius: 5px;
+      background: var(--panel); backdrop-filter: blur(4px);
+      border: 1px solid rgba(255,255,255,0.15); border-right: 3px solid var(--accent);
+      animation: chipIn .22s ease-out; transition: opacity .4s, transform .4s;
+  }
+  .action-chip .ac-icon   { font-size: 1.05rem; line-height: 1; }
+  .action-chip .ac-label  { flex: 1; }
+  .action-chip .ac-status { margin-left: auto; font-size: 0.95rem; font-weight: 900; }
+
+  .action-chip.exec {
+      border-right-color: var(--accent);
+      animation: chipIn .22s ease-out, execPulse .9s ease-in-out infinite;
+  }
+  .action-chip.exec .ac-status { color: var(--accent); }
+  .action-chip.done { border-right-color: var(--ok);     color: #cdeee0; }
+  .action-chip.done .ac-status { color: var(--ok); }
+  .action-chip.fail { border-right-color: var(--danger); color: #ffd0d8; }
+  .action-chip.fail .ac-status { color: var(--danger); }
+  .action-chip.fade { opacity: 0; transform: translateX(40px); }
+
+  @keyframes chipIn   { from { opacity: 0; transform: translateX(45px); } to { opacity: 1; transform: translateX(0); } }
+  @keyframes execPulse { 0%,100% { box-shadow: 0 0 8px rgba(0,229,255,0.35); } 50% { box-shadow: 0 0 20px rgba(0,229,255,0.85); } }
+
   {% if mode == 'stream' %}
   /* Broadcast view: purely passive — viewers must never be able to touch the drone */
   .controls, .action-buttons, .joystick-zone { pointer-events: none !important; }
@@ -353,6 +430,11 @@ HTML = r"""<!DOCTYPE html>
             </div>
             <div id="fps-display">-- fps</div>
         </div>
+    </div>
+
+    <div class="action-feed">
+        <div class="combo-badge" id="combo-badge">COMBO <span id="combo-count">x2</span></div>
+        <div class="action-list" id="action-list"></div>
     </div>
 
     <div class="telemetry">
@@ -410,6 +492,9 @@ ws.onmessage = e => {
         }
     }
 
+    // Combo action feed — works in BOTH control and stream mode
+    if (msg.actions !== undefined) renderActionFeed(msg.actions);
+
     // STREAM mode: passively replay the pilot's live joystick/telemetry from the server broadcast
     if (MODE === "stream" && msg.rc !== undefined) {
         document.getElementById("t-fwd").textContent = msg.rc.forward;
@@ -464,6 +549,79 @@ function setStreamKnob(zoneId, knobId, valX, valY) {
     knob.style.left = (cx + dx - knob.offsetWidth  / 2) + "px";
     knob.style.top  = (cy + dy - knob.offsetHeight / 2) + "px";
 }
+
+// ─── Combo action feed: visualise each discrete drone move (EXEC → DONE) ───
+const actionListEl = document.getElementById("action-list");
+const comboBadgeEl = document.getElementById("combo-badge");
+const comboCountEl = document.getElementById("combo-count");
+const seenActions  = new Map();   // server id -> { el, done }
+let comboCount = 0;
+let lastComboTime = 0;
+
+const ACTION_ICON = {
+  "FORWARD": "⬆", "BACK": "⬇", "LEFT": "⬅", "RIGHT": "➡",
+  "UP": "🔼", "DOWN": "🔽", "YAW LEFT": "↺", "YAW RIGHT": "↻",
+  "TAKEOFF": "🚀", "LAND": "🛬"
+};
+
+function renderActionFeed(actions) {
+  actions.forEach(a => {
+    let entry = seenActions.get(a.id);
+
+    if (!entry) {
+      // Brand-new move → build a chip and slide it in from the right
+      const el = document.createElement("div");
+      el.className = "action-chip exec";
+      el.innerHTML = '<span class="ac-icon"></span><span class="ac-label"></span><span class="ac-status">▶</span>';
+      el.querySelector(".ac-icon").textContent  = ACTION_ICON[a.label] || "●";
+      el.querySelector(".ac-label").textContent = a.label;
+      actionListEl.prepend(el);            // newest on top
+      entry = { el, done: false };
+      seenActions.set(a.id, entry);
+
+      // Combo counter: chain moves that fire in quick succession
+      const now = performance.now();
+      comboCount = (now - lastComboTime < 1600) ? comboCount + 1 : 1;
+      lastComboTime = now;
+      updateCombo();
+
+      while (actionListEl.children.length > 6) actionListEl.lastElementChild.remove();
+    }
+
+    // Transition EXEC → DONE / FAIL once, then fade the chip out
+    if (a.status !== "EXEC" && !entry.done) {
+      entry.done = true;
+      entry.el.classList.remove("exec");
+      entry.el.classList.add(a.status.toLowerCase());   // "done" | "fail"
+      entry.el.querySelector(".ac-status").textContent = (a.status === "DONE") ? "✓" : "✕";
+      const el = entry.el;
+      setTimeout(() => { el.classList.add("fade"); setTimeout(() => el.remove(), 400); }, 1200);
+    }
+  });
+
+  // Forget ids the server has already aged out of its buffer (prevents leaks/dupes)
+  if (actions.length) {
+    const minId = actions[0].id;   // action_log is oldest-first
+    for (const id of seenActions.keys()) if (id < minId) seenActions.delete(id);
+  }
+}
+
+function updateCombo() {
+  if (comboCount >= 2) {
+    comboCountEl.textContent = "x" + comboCount;
+    comboBadgeEl.classList.add("show");
+  } else {
+    comboBadgeEl.classList.remove("show");
+  }
+}
+
+// Drop the combo badge once the pilot pauses
+setInterval(() => {
+  if (comboCount > 0 && performance.now() - lastComboTime > 1600) {
+    comboCount = 0;
+    comboBadgeEl.classList.remove("show");
+  }
+}, 400);
 
 // ═══ Active control wiring — ONLY for the pilot at "/". Never runs in stream mode ═══
 if (MODE === "control") {
@@ -673,7 +831,9 @@ def websocket(ws):
             # Sent before the frame-skip below so mirroring keeps flowing even if video stalls.
             with rc_lock:
                 current_rc = dict(rc_state)
-            telemetry = {"rc": current_rc, "flying": flying}
+            with action_lock:
+                current_actions = [dict(a) for a in action_log]
+            telemetry = {"rc": current_rc, "flying": flying, "actions": current_actions}
             if loop_start - last_telemetry_sent > 1.0:
                 telemetry["battery"] = battery_level
                 last_telemetry_sent = loop_start
@@ -728,13 +888,17 @@ def websocket(ws):
 
         if cmd == "takeoff" and not flying and connected:
             print("[CMD] Takeoff")
+            aid = start_action("TAKEOFF")
             api.single_fly_takeoff()
+            finish_action(aid, "DONE")
             flying = True
             time.sleep(2)
 
         elif cmd == "land" and flying and connected:
             print("[CMD] Land")
+            aid = start_action("LAND")
             api.single_fly_touchdown()
+            finish_action(aid, "DONE")
             flying = False
             with rc_lock:
                 for k in rc_state: rc_state[k] = 0
