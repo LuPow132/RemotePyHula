@@ -397,6 +397,24 @@ HTML = r"""<!DOCTYPE html>
   @keyframes chipIn   { from { opacity: 0; transform: translateX(45px); } to { opacity: 1; transform: translateX(0); } }
   @keyframes execPulse { 0%,100% { box-shadow: 0 0 8px rgba(0,229,255,0.35); } 50% { box-shadow: 0 0 20px rgba(0,229,255,0.85); } }
 
+  /* On phones the top-right feed overlaps the right joystick / camera. Move it to the
+     middle-top, taking the place of the F/B·L/R telemetry bar (which we hide there). */
+  @media (pointer: coarse) and (max-width: 950px) {
+      .telemetry { display: none; }
+
+      .action-feed {
+          top: 12px; right: auto; left: 50%; transform: translateX(-50%);
+          align-items: center; max-width: 80vw;
+      }
+      .action-list { align-items: center; }
+      .action-chip { min-width: 0; }
+      /* keep the stack short so it never creeps down over the sticks */
+      .action-list .action-chip:nth-child(n+4) { display: none; }
+      /* chips now slide in from above rather than the right edge */
+      @keyframes chipIn { from { opacity: 0; transform: translateY(-16px); } to { opacity: 1; transform: translateY(0); } }
+      .action-chip.fade { opacity: 0; transform: translateY(-16px); }
+  }
+
   {% if mode == 'stream' %}
   /* Broadcast view: purely passive — viewers must never be able to touch the drone */
   .controls, .action-buttons, .joystick-zone { pointer-events: none !important; }
