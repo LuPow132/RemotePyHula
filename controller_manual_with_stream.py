@@ -59,7 +59,7 @@ socket.socket.connect = patched_connect
 socket.socket.sendto = patched_sendto
 # ========================================================
 
-from flask import Flask, render_template_string
+from flask import Flask, render_template_string, request
 from flask_sock import Sock
 import json, time, threading
 import os
@@ -214,7 +214,7 @@ HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, orientation=landscape">
-<title>DRONE//CTRL - MANUAL</title>
+<title>DRONE//CTRL - {{ mode|upper }}</title>
 <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@500;700;900&display=swap" rel="stylesheet">
 <style>
   :root {
@@ -320,6 +320,11 @@ HTML = r"""<!DOCTYPE html>
       border: 1px solid var(--accent); border-radius: 50%;
   }
 
+  {% if mode == 'stream' %}
+  /* Broadcast view: purely passive — viewers must never be able to touch the drone */
+  .controls, .action-buttons, .joystick-zone { pointer-events: none !important; }
+  {% endif %}
+
   @media (orientation: portrait) {
       .ui-layer::before {
           content: "PLEASE ROTATE YOUR PHONE TO LANDSCAPE";
@@ -378,6 +383,7 @@ HTML = r"""<!DOCTYPE html>
 </div>
 
 <script>
+const MODE = "{{ mode }}";   // "control" = the pilot at "/", "stream" = passive broadcast at "/stream"
 const proto = location.protocol === "https:" ? "wss:" : "ws:";
 const ws = new WebSocket(proto + "//" + location.host + "/ws");
 const statusEl = document.getElementById("conn-status");
@@ -398,9 +404,33 @@ ws.onmessage = e => {
     if (msg.battery !== undefined) {
         batEl.innerText = `BAT: ${msg.battery}${msg.battery !== "--" && msg.battery !== "OK" ? "%" : ""}`;
         if (parseInt(msg.battery) <= 20) {
-            batEl.style.color = "var(--neon-red)";
+            batEl.style.color = "var(--danger)";
         } else {
             batEl.style.color = "#f39c12";
+        }
+    }
+
+    // STREAM mode: passively replay the pilot's live joystick/telemetry from the server broadcast
+    if (MODE === "stream" && msg.rc !== undefined) {
+        document.getElementById("t-fwd").textContent = msg.rc.forward;
+        document.getElementById("t-rgt").textContent = msg.rc.right;
+        document.getElementById("t-up").textContent  = msg.rc.up;
+        document.getElementById("t-yaw").textContent = msg.rc.yaw;
+
+        // Same axis mapping as the live joysticks, reversed to place the knobs
+        setStreamKnob("left-zone",  "left-knob",  msg.rc.yaw,   -msg.rc.up);
+        setStreamKnob("right-zone", "right-knob", msg.rc.right, -msg.rc.forward);
+
+        if (msg.flying !== undefined) {
+            const btnTk = document.getElementById("btn-takeoff");
+            const btnLd = document.getElementById("btn-land");
+            if (msg.flying) {
+                btnTk.style.background = "rgba(0,255,136,0.3)";
+                btnLd.style.background = "rgba(0,0,0,0.5)";
+            } else {
+                btnTk.style.background = "rgba(0,0,0,0.5)";
+                btnLd.style.background = "rgba(255,45,85,0.3)";
+            }
         }
     }
     return;
@@ -422,6 +452,21 @@ ws.onmessage = e => {
   }
 };
 
+// ─── Passive knob positioning used by STREAM (broadcast) mode ───
+function setStreamKnob(zoneId, knobId, valX, valY) {
+    const zone = document.getElementById(zoneId);
+    const knob = document.getElementById(knobId);
+    if (!zone || !knob) return;
+    const limit = (zone.offsetWidth / 2) - 23;
+    const cx = zone.offsetWidth / 2, cy = zone.offsetHeight / 2;
+    const dx = (valX / 100) * limit;
+    const dy = (valY / 100) * limit;
+    knob.style.left = (cx + dx - knob.offsetWidth  / 2) + "px";
+    knob.style.top  = (cy + dy - knob.offsetHeight / 2) + "px";
+}
+
+// ═══ Active control wiring — ONLY for the pilot at "/". Never runs in stream mode ═══
+if (MODE === "control") {
 document.getElementById("btn-takeoff").onclick = () => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ cmd: "takeoff" })); };
 document.getElementById("btn-land").onclick    = () => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ cmd: "land" })); };
 
@@ -540,7 +585,40 @@ window.addEventListener("keyup", e => {
 });
 
 window.addEventListener("blur", () => { keysPressed.clear(); updateFromKeyboard(); });
+} // ═══ end if (MODE === "control") ═══
 </script>
+</body>
+</html>
+"""
+
+# ─────────────────────────────────────────
+#  Stream (broadcast) login page
+# ─────────────────────────────────────────
+STREAM_PASS = "ddm2026"   # unlock via /stream?pass=ddm2026  or the login form (case-insensitive)
+
+LOGIN_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>STREAM LOGIN</title>
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@500;700;900&display=swap" rel="stylesheet">
+<style>
+  body { background: #000; color: #00e5ff; font-family: 'Orbitron', sans-serif; display: flex; flex-direction: column; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+  input { padding: 15px; margin: 20px 0; border: 1px solid #00e5ff; background: rgba(0,229,255,0.1); color: #fff; text-align: center; font-family: 'Share Tech Mono', monospace; outline: none; font-size: 1.2rem; }
+  button { padding: 15px 40px; background: #00e5ff; color: #000; border: none; font-weight: bold; cursor: pointer; font-size: 1rem; box-shadow: 0 0 15px rgba(0,229,255,0.5); font-family: 'Orbitron', sans-serif;}
+  button:hover { background: #fff; box-shadow: 0 0 25px #fff; }
+  .error { color: #ff2d55; margin-top: 15px; font-family: 'Share Tech Mono', monospace; letter-spacing: 1px;}
+</style>
+</head>
+<body>
+    <form method="POST" style="text-align: center;">
+        <h2 style="text-shadow: 0 0 10px #00e5ff; letter-spacing: 2px;">STREAM//ACCESS</h2>
+        <input type="password" name="pwd" placeholder="ENTER PASSWORD" autofocus autocomplete="off">
+        <br>
+        <button type="submit">AUTHENTICATE</button>
+        {% if error %}<div class="error">ACCESS DENIED - INVALID PASSCODE</div>{% endif %}
+    </form>
 </body>
 </html>
 """
@@ -550,7 +628,23 @@ window.addEventListener("blur", () => { keysPressed.clear(); updateFromKeyboard(
 # ─────────────────────────────────────────
 @app.route("/")
 def index():
-    return render_template_string(HTML)
+    return render_template_string(HTML, mode="control")
+
+@app.route("/stream", methods=["GET", "POST"])
+def stream_page():
+    # Query-string unlock: /stream?pass=ddm2026  (handy as an OBS browser source)
+    q = request.args.get("pass")
+    if q is not None and q.lower() == STREAM_PASS:
+        return render_template_string(HTML, mode="stream")
+
+    # Login-form unlock (fallback when no valid ?pass= is supplied)
+    if request.method == "POST":
+        pwd = request.form.get("pwd", "")
+        if pwd.lower() == STREAM_PASS:
+            return render_template_string(HTML, mode="stream")
+        return render_template_string(LOGIN_HTML, error=True)
+
+    return render_template_string(LOGIN_HTML, error=False)
 
 @sock.route("/ws")
 def websocket(ws):
@@ -574,6 +668,20 @@ def websocket(ws):
                 cv2.putText(placeholder, "NO SIGNAL", (120, 170), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 200, 80), 3)
                 frame, frame_id = placeholder, -1
 
+            # Broadcast the pilot's live RC + flight state every tick (~TARGET_FPS Hz) so the
+            # /stream page mirrors the joysticks 1-to-1. Battery is bundled in only once a second.
+            # Sent before the frame-skip below so mirroring keeps flowing even if video stalls.
+            with rc_lock:
+                current_rc = dict(rc_state)
+            telemetry = {"rc": current_rc, "flying": flying}
+            if loop_start - last_telemetry_sent > 1.0:
+                telemetry["battery"] = battery_level
+                last_telemetry_sent = loop_start
+            try:
+                ws.send(json.dumps(telemetry))
+            except:
+                break
+
             # Skip re-encoding/re-sending a frame the camera thread hasn't updated yet
             if frame_id == last_sent_id:
                 time.sleep(FRAME_INTERVAL)
@@ -591,13 +699,6 @@ def websocket(ws):
                     break
                 send_time = time.time() - send_start
                 last_sent_id = frame_id
-
-                if loop_start - last_telemetry_sent > 1.0:
-                    try:
-                        ws.send(json.dumps({"battery": battery_level}))
-                    except:
-                        break
-                    last_telemetry_sent = loop_start
 
                 # Adaptive quality: back off if encode+send can't keep up with the
                 # frame budget, ease back up once the link has headroom again.
@@ -647,4 +748,5 @@ def websocket(ws):
 
 if __name__ == "__main__":
     print("🌐 Manual Control Server running on http://0.0.0.0:8080")
+    print("📡 Stream (broadcast) Subpage on   http://0.0.0.0:8080/stream?pass=ddm2026")
     app.run(host="0.0.0.0", port=8080, debug=False, threaded=True)
