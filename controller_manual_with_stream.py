@@ -93,21 +93,9 @@ if not connected:
     print("❌ Could not connect to drone. Running in mock mode.")
 
 # ─────────────────────────────────────────
-#  Battery Checker Thread (เช็คแบตทุกๆ 5 วินาที)
+#  (Battery polling + link health-check now live in the Connection Manager
+#   further down, so a mid-session drop triggers an automatic reconnect.)
 # ─────────────────────────────────────────
-def battery_loop():
-    global battery_level
-    while connected:
-        time.sleep(5)
-        try:
-            if hasattr(api, 'get_electic'): battery_level = str(api.get_electic())
-            elif hasattr(api, 'get_battery'): battery_level = str(api.get_battery())
-            else: battery_level = "OK" 
-        except:
-            battery_level = "--"
-
-if connected:
-    threading.Thread(target=battery_loop, daemon=True).start()
 
 # ─────────────────────────────────────────
 #  Camera Thread
@@ -149,8 +137,58 @@ def camera_loop():
         except:
             time.sleep(0.1)
 
+def start_camera():
+    """Launch the camera pipeline thread if it isn't already running."""
+    global camera_running
+    if not camera_running:
+        camera_running = True
+        threading.Thread(target=camera_loop, daemon=True).start()
+
 if connected:
-    threading.Thread(target=camera_loop, daemon=True).start()
+    start_camera()
+
+# ─────────────────────────────────────────
+#  Connection Manager — polls battery as a health check and AUTO-RECONNECTS the
+#  drone link if it drops mid-session (also connects late if the drone wasn't
+#  available at startup).
+# ─────────────────────────────────────────
+def connection_manager():
+    global connected, battery_level, camera_running
+    fails = 0
+    while True:
+        time.sleep(3)
+        if connected:
+            # Reading battery doubles as a liveness probe for the drone link.
+            try:
+                if hasattr(api, 'get_electic'):  val = api.get_electic()
+                elif hasattr(api, 'get_battery'): val = api.get_battery()
+                else: val = "OK"
+                if val in (None, "", -1):
+                    raise RuntimeError("empty battery reading")
+                battery_level = str(val)
+                fails = 0
+            except Exception:
+                fails += 1
+                if fails >= 3:                    # ~9s of failed reads → assume the link is down
+                    print("⚠️ [LINK] Drone connection lost — auto-reconnecting...")
+                    connected = False
+                    camera_running = False        # stop the now-dead camera loop
+                    battery_level = "--"
+        else:
+            # Keep hammering connect() until the drone comes back.
+            try:
+                ok = api.connect()
+            except Exception:
+                ok = False
+            if ok:
+                print("✅ [LINK] Drone reconnected.")
+                connected = True
+                fails = 0
+                start_camera()                    # relaunch the camera pipeline
+            else:
+                print("📡 [LINK] Reconnect attempt failed, retrying...")
+
+threading.Thread(target=connection_manager, daemon=True).start()
 
 # ─────────────────────────────────────────
 #  RC state (🚀 โหมดลื่นไหลขั้นสุด Dominant Axis Control)
@@ -485,20 +523,53 @@ HTML = r"""<!DOCTYPE html>
 <script>
 const MODE = "{{ mode }}";   // "control" = the pilot at "/", "stream" = passive broadcast at "/stream"
 const proto = location.protocol === "https:" ? "wss:" : "ws:";
-const ws = new WebSocket(proto + "//" + location.host + "/ws");
 const statusEl = document.getElementById("conn-status");
 const batEl = document.getElementById("battery-status");
 const camEl = document.getElementById("cam");
 const fpsEl = document.getElementById("fps-display");
 
-ws.onopen  = () => { statusEl.textContent = "LINK ACTIVE"; statusEl.className = "live"; };
-ws.onclose = () => { statusEl.textContent = "OFFLINE"; statusEl.className = ""; };
+// Self-healing WebSocket: reconnects after wifi blips, phone sleep, or server restarts.
+let ws = null;
+let reconnectTimer = null;
+let reconnectDelay = 500;   // backoff, grows up to a cap
+
+function connectWS() {
+  ws = new WebSocket(proto + "//" + location.host + "/ws");
+  ws.onopen = () => {
+    statusEl.textContent = "LINK ACTIVE"; statusEl.className = "live";
+    reconnectDelay = 500;   // reset backoff after a healthy connect
+  };
+  ws.onclose = () => {
+    statusEl.textContent = "RECONNECTING"; statusEl.className = "warn";
+    scheduleReconnect();
+  };
+  ws.onerror = () => { try { ws.close(); } catch (_) {} };   // force onclose → reconnect
+  ws.onmessage = handleMessage;
+}
+
+function scheduleReconnect() {
+  if (reconnectTimer) return;               // one pending attempt at a time
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectWS();
+  }, reconnectDelay);
+  reconnectDelay = Math.min(Math.round(reconnectDelay * 1.6), 5000);
+}
+
+// Reconnect instantly when the network returns or the tab/phone wakes back up.
+function ensureConnected() {
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  reconnectDelay = 500;
+  connectWS();
+}
+window.addEventListener("online", ensureConnected);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) ensureConnected(); });
 
 let fTimes = [];
-
 let lastFrameUrl = null;
 
-ws.onmessage = e => {
+function handleMessage(e) {
   if (typeof e.data === "string") {
     const msg = JSON.parse(e.data);
     if (msg.battery !== undefined) {
@@ -553,7 +624,10 @@ ws.onmessage = e => {
     const span = fTimes[fTimes.length - 1] - fTimes[0];
     fpsEl.textContent = ((fTimes.length - 1) / span * 1000).toFixed(1) + " FPS";
   }
-};
+}
+
+// Open the first connection (auto-reconnect takes over from here)
+connectWS();
 
 // ─── Passive knob positioning used by STREAM (broadcast) mode ───
 function setStreamKnob(zoneId, knobId, valX, valY) {
