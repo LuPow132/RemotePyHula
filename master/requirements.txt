@@ -1,0 +1,4 @@
+# Master dashboard only. It never talks to a drone, so no pyhula / opencv / numpy here.
+#   pip install -r requirements.txt
+#   python master_dashboard.py      -> http://localhost:5050
+flask

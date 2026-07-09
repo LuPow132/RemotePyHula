@@ -1,0 +1,12 @@
+# Slave deps. IMPORTANT: install these into a venv created INSIDE this folder,
+# because slave_agent.bat looks for the venv here and agent.py launches the
+# controller with that same interpreter. pyhula must live in it.
+#
+#   python -m venv .venv
+#   .venv\Scripts\python.exe -m pip install -r requirements.txt
+#   .venv\Scripts\python.exe -m pip install pyhula-1.1.8-cp312-cp312-win_amd64.whl
+#   slave_agent.bat
+flask
+flask-sock
+opencv-python
+numpy
