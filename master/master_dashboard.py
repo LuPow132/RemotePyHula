@@ -12,7 +12,7 @@
 # ============================================================
 import os, json, urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, send_from_directory
 
 HERE        = os.path.dirname(os.path.abspath(__file__))
 FLEET_FILE  = os.path.join(HERE, "fleet.json")
@@ -94,6 +94,13 @@ def api_land_all():
         results = list(ex.map(land, slaves))
     return jsonify(ok=all(r["ok"] for r in results), results=results)
 
+@app.route("/api/<name>/passcode_refresh", methods=["POST"])
+def api_passcode_refresh(name):
+    host = host_for(name)
+    if not host:
+        return jsonify(ok=False, error="unknown slave"), 404
+    return jsonify(agent_call(host, "/passcode_refresh", method="POST", timeout=10))
+
 @app.route("/api/<name>/logs")
 def api_logs(name):
     host = host_for(name)
@@ -116,6 +123,10 @@ def api_connect(name):
     data = request.get_json(force=True, silent=True) or {}
     return jsonify(agent_call(host, "/connect_wifi", method="POST", data=data, timeout=25))
 
+@app.route("/logo.png")
+def logo():
+    return send_from_directory(HERE, "logo.png")
+
 @app.route("/")
 def index():
     return render_template_string(DASH_HTML)
@@ -134,9 +145,8 @@ DASH_HTML = r"""<!DOCTYPE html>
   :root { --accent:#00e5ff; --danger:#ff2d55; --ok:#00ff88; --warn:#f39c12; --panel:rgba(12,20,30,.85); }
   * { box-sizing:border-box; margin:0; padding:0; }
   body { background:#05080d; color:#dfefff; font-family:'Share Tech Mono',monospace; min-height:100vh; padding:22px; }
-  h1 { font-family:'Orbitron',sans-serif; font-weight:900; font-size:1.4rem; color:var(--accent);
-       text-shadow:0 0 12px var(--accent); letter-spacing:2px; margin-bottom:4px; }
-  h1 span { color:var(--danger); }
+  .logo-img { height:38px; width:auto; display:block; margin-bottom:6px;
+              filter:drop-shadow(0 0 8px rgba(0,229,255,.45)); }
   .sub { font-size:.75rem; color:#7fa; opacity:.6; margin-bottom:18px; }
 
   .topbar { display:flex; justify-content:space-between; align-items:flex-start; gap:16px; }
@@ -168,6 +178,19 @@ DASH_HTML = r"""<!DOCTYPE html>
   .bar { height:9px; border-radius:5px; background:rgba(255,255,255,.1); overflow:hidden; }
   .bar > i { display:block; height:100%; background:var(--ok); transition:width .4s; }
   .bar.low > i { background:var(--danger); }
+
+  /* 6-digit player passcode */
+  .code-row { display:flex; align-items:center; gap:10px; margin:12px 0 4px; }
+  .code-box {
+      flex:1; display:flex; align-items:center; justify-content:space-between; gap:8px;
+      background:#0a121c; border:1px solid rgba(0,229,255,.35); border-radius:6px; padding:8px 12px;
+  }
+  .code-lbl { font-size:.6rem; color:#6ab; letter-spacing:1px; }
+  .code-val {
+      font-family:'Orbitron',sans-serif; font-weight:900; font-size:1.5rem; letter-spacing:6px;
+      color:var(--accent); text-shadow:0 0 12px rgba(0,229,255,.6); text-indent:6px;
+  }
+  .code-val.none { color:#556; text-shadow:none; font-size:1rem; letter-spacing:2px; }
 
   .link { display:flex; gap:8px; align-items:center; margin:10px 0; font-size:.72rem; }
   .link input { flex:1; background:#0a121c; border:1px solid rgba(0,229,255,.3); color:var(--accent);
@@ -206,7 +229,7 @@ DASH_HTML = r"""<!DOCTYPE html>
 <body>
   <div class="topbar">
     <div>
-      <h1>DRONE<span>//</span>FLEET</h1>
+      <img class="logo-img" src="/logo.png" alt="DRONE//VPN">
       <div class="sub" id="clock">connecting…</div>
     </div>
     <div style="text-align:right">
@@ -292,6 +315,13 @@ function makeCard(s) {
         <div class="row" style="font-size:.7rem"><span>BATTERY</span><b class="c-battxt">--</b></div>
         <div class="bar"><i style="width:0%"></i></div>
       </div>
+      <div class="code-row">
+        <div class="code-box">
+          <span class="code-lbl">PLAYER<br>CODE</span>
+          <span class="code-val c-code none">------</span>
+        </div>
+        <button class="b-re c-newcode" title="Issue a new code. Kicks the current player; OBS stream is unaffected.">NEW CODE</button>
+      </div>
       <div class="link">
         <input class="c-link" readonly value="">
         <button class="b-alt c-copy">COPY</button>
@@ -325,6 +355,7 @@ function makeCard(s) {
     wifi: q(".wifi"), sel: q(".c-ssidsel"), pwd: q(".c-pwd"), msg: q(".c-msg"),
     err: q(".c-err"), pinned: false,   // pinned = an action message is showing; don't overwrite it
     logEl: q(".c-log"), logBtn: q(".c-logs"), logOpen: false,
+    codeEl: q(".c-code"), newCodeBtn: q(".c-newcode"),
   };
   q(".c-name").textContent = s.name;
 
@@ -332,6 +363,7 @@ function makeCard(s) {
   q(".c-stop").onclick       = () => act(c, "stop");
   q(".c-restart").onclick    = () => act(c, "restart");
   q(".c-land").onclick       = () => act(c, "land");
+  c.newCodeBtn.onclick       = () => newCode(c);
   c.logBtn.onclick           = () => toggleLogs(c);
   q(".c-wifitoggle").onclick = () => c.wifi.classList.toggle("open");
   q(".c-scan").onclick       = () => scan(c);
@@ -362,6 +394,11 @@ function update(c, s) {
   c.batTxt.textContent  = isNaN(bat) ? "--" : bat + "%";
   c.barFill.style.width = pct + "%";
   c.bar.classList.toggle("low", !isNaN(bat) && bat <= 20);
+
+  const code = s.passcode || "";
+  c.codeEl.textContent = code || (s.running ? "……" : "------");
+  c.codeEl.classList.toggle("none", !code);
+  c.newCodeBtn.disabled = !s.online || !s.running;
 
   c.link = s.link || "";
   const shown = c.link || "(no player link yet)";
@@ -450,6 +487,25 @@ async function refresh() {
   } catch (e) {
     document.getElementById("clock").textContent = "dashboard error: " + e;
   }
+}
+
+// Issue a fresh 6-digit code. The current player is kicked back to the gate;
+// the /stream page (OBS) is deliberately left connected.
+async function newCode(c) {
+  c.pinned = true;
+  c.err.className = "msg"; c.err.textContent = "issuing new code…";
+  const r = await api(`/api/${c.name}/passcode_refresh`, { method: "POST" });
+  if (r.ok && r.code) {
+    c.codeEl.textContent = r.code;
+    c.codeEl.classList.remove("none");
+    c.err.textContent = "new code " + r.code + " — previous player kicked";
+    c.err.className = "msg";
+  } else {
+    c.err.textContent = "new code FAILED: " + (r.error || "?");
+    c.err.className = "msg err";
+  }
+  setTimeout(() => { c.pinned = false; }, 6000);
+  refresh();
 }
 
 async function act(c, action) {
