@@ -70,10 +70,11 @@ socket.socket.connect = patched_connect
 socket.socket.sendto = patched_sendto
 # ========================================================
 
-from flask import Flask, render_template_string, request
+from flask import Flask, render_template_string, request, session, redirect, send_from_directory
 from flask_sock import Sock
 import json, time, threading
 import os
+import secrets
 from collections import deque
 import cv2
 import numpy as np
@@ -87,6 +88,39 @@ os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
 
 app = Flask(__name__)
 sock = Sock(app)
+
+# Folder this script lives in — logo.png must sit right next to it (root, or the
+# Slave/ folder on a deployed laptop). Copy the file alongside whenever you copy this.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Fresh secret each start, so a restart also invalidates every old session cookie.
+app.secret_key = secrets.token_hex(32)
+
+# ─────────────────────────────────────────
+#  Player passcode — a 6-digit gate on the pilot page.
+#  Each drone owns its own code. Bumping the version invalidates every pilot session
+#  (they're kicked back to the gate) WITHOUT touching /stream viewers, so OBS never
+#  has to re-authenticate when you hand the drone to the next player.
+# ─────────────────────────────────────────
+passcode         = None
+passcode_version = 0
+passcode_lock    = threading.Lock()
+
+def new_passcode():
+    global passcode, passcode_version
+    with passcode_lock:
+        passcode = f"{secrets.randbelow(1_000_000):06d}"   # uniform, cryptographically random
+        passcode_version += 1
+        return passcode, passcode_version
+
+new_passcode()
+
+def pilot_authed():
+    """True only for a session that entered the CURRENT code."""
+    return session.get("code_v") == passcode_version
+
+def stream_authed():
+    return bool(session.get("stream_ok"))
 
 # ─────────────────────────────────────────
 #  Drone connection
@@ -393,9 +427,13 @@ HTML = r"""<!DOCTYPE html>
   .header {
       display: flex; justify-content: space-between; align-items: flex-start; pointer-events: auto;
   }
-  .logo { font-family: 'Orbitron', sans-serif; font-size: 1.2rem; font-weight: 900; color: var(--accent); text-shadow: 0 0 10px var(--accent); }
-  .logo span { color: var(--danger); }
-  .kb-hint { font-size: 0.55rem; color: rgba(255,255,255,0.4); letter-spacing: 1px; margin-top: 4px; text-shadow: none; }
+  .logo { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .logo-img { height: 34px; width: auto; display: block; filter: drop-shadow(0 0 8px rgba(0,229,255,0.45)); }
+  .mode-badge {
+      font-family: 'Orbitron', sans-serif; font-size: 0.62rem; font-weight: 900; letter-spacing: 2px;
+      color: var(--danger); text-shadow: 0 0 8px var(--danger);
+  }
+  .kb-hint { flex-basis: 100%; font-size: 0.55rem; color: rgba(255,255,255,0.4); letter-spacing: 1px; margin-top: 2px; text-shadow: none; }
   
   .status-box {
       background: var(--panel); border: 1px solid var(--accent); padding: 5px 10px; border-radius: 4px;
@@ -581,7 +619,9 @@ HTML = r"""<!DOCTYPE html>
 
 <div class="ui-layer">
     <div class="header">
-        <div class="logo">DRONE<span>//</span>CTRL
+        <div class="logo">
+            <img class="logo-img" src="/logo.png" alt="DRONE//VPN">
+            <span class="mode-badge">{{ mode|upper }}</span>
             <div class="kb-hint">WASD / IJKL &middot; &uarr; TAKEOFF &middot; &darr; LAND</div>
         </div>
         <div class="status-box">
@@ -714,6 +754,16 @@ let videoMode = (function () {
 function handleMessage(e) {
   if (typeof e.data === "string") {
     const msg = JSON.parse(e.data);
+
+    // Operator issued a new passcode — this session is over. Reload to the gate.
+    // (Only pilots ever receive this; stream viewers are never kicked.)
+    if (msg.kick) {
+      stopRenderLoop();
+      try { ws.onclose = null; ws.close(); } catch (_) {}
+      location.reload();
+      return;
+    }
+
     if (msg.rtt  !== undefined) lastRtt  = msg.rtt;
     if (msg.win  !== undefined) lastWin  = msg.win;
     if (msg.kbps !== undefined) lastKbps = msg.kbps;
@@ -1065,6 +1115,60 @@ window.addEventListener("blur", () => { keysPressed.clear(); updateFromKeyboard(
 """
 
 # ─────────────────────────────────────────
+#  Player gate — 6-digit passcode, shown on the master dashboard
+# ─────────────────────────────────────────
+GATE_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>DRONE//ACCESS</title>
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@500;700;900&display=swap" rel="stylesheet">
+<style>
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:#000; color:#00e5ff; font-family:'Orbitron',sans-serif;
+         display:flex; flex-direction:column; justify-content:center; align-items:center;
+         height:100vh; text-align:center; padding:20px; }
+  h2 { text-shadow:0 0 14px #00e5ff; letter-spacing:3px; font-size:1.2rem; }
+  p  { font-family:'Share Tech Mono',monospace; font-size:.75rem; color:#6ab; margin-top:8px; letter-spacing:1px; }
+  input {
+      margin:26px 0 18px; padding:16px; width:260px; border:2px solid #00e5ff; border-radius:6px;
+      background:rgba(0,229,255,.08); color:#fff; text-align:center;
+      font-family:'Orbitron',sans-serif; font-size:2rem; font-weight:900; letter-spacing:12px;
+      outline:none; text-indent:12px;
+  }
+  input:focus { box-shadow:0 0 25px rgba(0,229,255,.6); }
+  button { padding:15px 44px; background:#00e5ff; color:#000; border:none; border-radius:6px;
+           font-weight:900; letter-spacing:2px; cursor:pointer; font-size:.95rem;
+           box-shadow:0 0 18px rgba(0,229,255,.5); font-family:'Orbitron',sans-serif; }
+  button:hover  { background:#fff; box-shadow:0 0 30px #fff; }
+  button:active { transform:scale(.95); }
+  .error { color:#ff2d55; margin-top:16px; font-family:'Share Tech Mono',monospace; letter-spacing:1px; font-size:.8rem; }
+</style>
+</head>
+<body>
+  <form method="POST" autocomplete="off">
+    <h2>DRONE<span style="color:#ff2d55">//</span>ACCESS</h2>
+    <p>ENTER THE 6-DIGIT CODE FROM THE OPERATOR</p>
+    <input name="code" inputmode="numeric" pattern="[0-9]*" maxlength="6"
+           placeholder="000000" autofocus required>
+    <br>
+    <button type="submit">UNLOCK</button>
+    {% if error %}<div class="error">WRONG CODE &mdash; ASK THE OPERATOR</div>{% endif %}
+  </form>
+<script>
+  // Digits only, and auto-submit the moment 6 are entered.
+  const i = document.querySelector("input[name=code]");
+  i.addEventListener("input", () => {
+    i.value = i.value.replace(/\D/g, "").slice(0, 6);
+    if (i.value.length === 6) i.form.submit();
+  });
+</script>
+</body>
+</html>
+"""
+
+# ─────────────────────────────────────────
 #  Stream (broadcast) login page
 # ─────────────────────────────────────────
 STREAM_PASS = "ddm2026"   # unlock via /stream?pass=ddm2026  or the login form (case-insensitive)
@@ -1099,9 +1203,38 @@ LOGIN_HTML = r"""<!DOCTYPE html>
 # ─────────────────────────────────────────
 #  Routes
 # ─────────────────────────────────────────
-@app.route("/")
+@app.route("/logo.png")
+def logo():
+    return send_from_directory(BASE_DIR, "logo.png")
+
+@app.route("/", methods=["GET", "POST"])
 def index():
+    """Pilot page, gated behind the 6-digit passcode."""
+    if request.method == "POST":
+        entered = (request.form.get("code") or "").strip()
+        if secrets.compare_digest(entered, passcode or ""):   # constant-time
+            session["code_v"] = passcode_version
+            return redirect("/")
+        return render_template_string(GATE_HTML, error=True)
+
+    if not pilot_authed():
+        return render_template_string(GATE_HTML, error=False)
     return render_template_string(HTML, mode="control")
+
+# ---- Passcode API (token-protected; 8080 is public via the Funnel) ----
+@app.route("/passcode")
+def passcode_get():
+    if not CONTROL_TOKEN or request.headers.get("X-Token") != CONTROL_TOKEN:
+        return {"ok": False, "error": "unauthorized"}, 401
+    return {"ok": True, "code": passcode, "version": passcode_version}
+
+@app.route("/passcode/refresh", methods=["POST"])
+def passcode_refresh():
+    if not CONTROL_TOKEN or request.headers.get("X-Token") != CONTROL_TOKEN:
+        return {"ok": False, "error": "unauthorized"}, 401
+    code, ver = new_passcode()      # bumping the version kicks every current pilot
+    print(f"[CODE] New passcode issued (v{ver})")
+    return {"ok": True, "code": code, "version": ver}
 
 # Port 8080 is published to the public internet by the Tailscale Funnel, so a remote
 # LAND endpoint MUST be authenticated — otherwise any player could ground the fleet.
@@ -1147,15 +1280,19 @@ def health():
 
 @app.route("/stream", methods=["GET", "POST"])
 def stream_page():
+    # Stream viewers are deliberately NOT tied to passcode_version — refreshing the
+    # player code must never disturb an OBS browser source that's already live.
     # Query-string unlock: /stream?pass=ddm2026  (handy as an OBS browser source)
     q = request.args.get("pass")
     if q is not None and q.lower() == STREAM_PASS:
+        session["stream_ok"] = True
         return render_template_string(HTML, mode="stream")
 
     # Login-form unlock (fallback when no valid ?pass= is supplied)
     if request.method == "POST":
         pwd = request.form.get("pwd", "")
         if pwd.lower() == STREAM_PASS:
+            session["stream_ok"] = True
             return render_template_string(HTML, mode="stream")
         return render_template_string(LOGIN_HTML, error=True)
 
@@ -1186,7 +1323,17 @@ PACE_INTERVAL = 1.0 / TARGET_FPS
 @sock.route("/ws")
 def websocket(ws):
     global flight_state
-    print("[WS] Client connected")
+
+    # The socket must be authorised in its own right — otherwise the 6-digit gate on "/"
+    # is decoration: anyone could open /ws directly and fly the drone.
+    is_pilot  = pilot_authed()
+    is_viewer = stream_authed()
+    if not (is_pilot or is_viewer):
+        print("[WS] Rejected: not authenticated")
+        return
+    my_code_v = session.get("code_v")     # snapshot; a refresh will no longer match
+
+    print(f"[WS] Client connected ({'pilot' if is_pilot else 'viewer'})")
 
     # Small writes (telemetry JSON) interleaved with big binary frames let Nagle's
     # algorithm sit on data for ~40-200ms waiting to coalesce. Turn it off.
@@ -1218,6 +1365,16 @@ def websocket(ws):
 
         while True:
             now = time.time()
+
+            # ---- Passcode was refreshed → drop this pilot back to the gate.
+            #      Stream viewers are untouched, so OBS keeps running.
+            if is_pilot and my_code_v != passcode_version:
+                try:
+                    ws.send(json.dumps({"kick": "code"}))
+                except Exception:
+                    pass
+                print("[WS] Pilot kicked: passcode refreshed")
+                break
 
             # ---- Telemetry: small + independent of the video backpressure ----
             if now - last_telemetry > FRAME_INTERVAL:
@@ -1347,6 +1504,11 @@ def websocket(ws):
                         st["window"] = min(wmax, st["window"] + 1)
                         st["grow"] = 0
                 st["window"] = min(st["window"], wmax)   # clamp if the mode just changed
+            continue
+
+        # From here down are FLIGHT commands. Only an authenticated pilot may send them —
+        # a /stream viewer's socket must never be able to move the drone.
+        if cmd in ("takeoff", "land", "rc", "set_state") and not is_pilot:
             continue
 
         # Viewer chose LOW-LATENCY vs SMOOTH — only affects this one connection.
